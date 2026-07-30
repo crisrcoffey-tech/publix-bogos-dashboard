@@ -8,4 +8,4 @@
 // See config.example.js and SUPABASE_SETUP.md for the full walkthrough.
 
 window.SUPABASE_URL = "https://poxkytsrejvolfvurthj.supabase.co";
-window.SUPABASE_ANON_KEY = "sb_publishable_Xf46fYPbwj-l4j7mIPwVnw_wJz6hpDp";
+window.SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBveGt5dHNyZWp2b2xmdnVydGhqIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODIyNzU5MDUsImV4cCI6MjA5Nzg1MTkwNX0._KoXPVZDCNVwMySGG00LzA3TVySb_xd3110oIy8e_PA";
