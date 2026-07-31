@@ -1017,7 +1017,11 @@
   // Single-store filter. null = all stores. When set, header shows that store's
   // own weekOf instead of the generic freshness label.
   let activeStore = null;
-  // Debounce handle for keyword persistence.
+  // Debounce handles: one throttles re-renders while typing (the deal grid
+  // is ~1500 items so a per-keystroke render blocks the main thread for
+  // hundreds of ms and eats subsequent keystrokes); the other batches the
+  // Supabase persistence write.
+  let _kwRenderTimer = null;
   let _kwSaveTimer = null;
 
   // Sync UI-owned filter state FROM the persisted prefs (called after auth /
@@ -1025,18 +1029,25 @@
   // whatever they last saved. Watchlist stays in prefs.js.
   function syncFiltersFromPrefs() {
     const prefs = window.publixPrefs?.currentFilters?.() || null;
+    const kwInput = document.getElementById('keywordInput');
+    // If the user is actively editing the keyword input, do NOT overwrite
+    // their in-flight value or the module state derived from it. The prior
+    // version reset kwInput.value on every rerenderAll — including the
+    // async post-data-load and post-auth-resolve rerenders — which silently
+    // wiped whatever the user typed before those fired. That's why typing
+    // in the search box looked like it had no effect.
+    const userIsTypingKeyword = kwInput && document.activeElement === kwInput;
     if (!prefs) {
       activeCategories = new Set();
-      activeKeyword = '';
+      if (!userIsTypingKeyword) activeKeyword = '';
       activeBogo = false;
     } else {
       activeCategories = new Set(Array.isArray(prefs.categories) ? prefs.categories : []);
-      activeKeyword = String(prefs.keyword || '');
+      if (!userIsTypingKeyword) activeKeyword = String(prefs.keyword || '');
       activeBogo = !!prefs.bogo_only;
     }
     // Reflect into the UI controls if they exist.
-    const kwInput = document.getElementById('keywordInput');
-    if (kwInput) {
+    if (kwInput && !userIsTypingKeyword) {
       kwInput.value = activeKeyword;
       const clr = document.getElementById('keywordClear');
       if (clr) clr.hidden = !activeKeyword;
@@ -1379,13 +1390,20 @@
     const bogoBtn = document.getElementById('bogoToggle');
 
     if (kwInput) {
-      // Live filter as they type; debounce persistence to Supabase.
+      // Live filter as they type — but debounce both the (expensive) render
+      // and the Supabase persistence write. Without the render debounce a
+      // full re-render fires on every keystroke and blocks the main thread
+      // long enough that fast typers lose characters or feel the input is
+      // frozen (the original symptom: 'typing has no visible effect').
       kwInput.addEventListener('input', () => {
         activeKeyword = kwInput.value;
         if (kwClear) kwClear.hidden = !activeKeyword;
-        renderChips();
-        renderDeals();
-        renderFilterPill();
+        clearTimeout(_kwRenderTimer);
+        _kwRenderTimer = setTimeout(() => {
+          renderChips();
+          renderDeals();
+          renderFilterPill();
+        }, 90);
         clearTimeout(_kwSaveTimer);
         _kwSaveTimer = setTimeout(() => {
           window.publixPrefs?.setKeyword?.(activeKeyword);
