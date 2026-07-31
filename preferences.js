@@ -18,11 +18,53 @@ let signedIn = false;
 // "are we signed in?" synchronously when the user taps Preferences — no race
 // against Supabase's async getSession() / localStorage write.
 let currentUser = null;
-// Some deployments haven't yet migrated to include the keyword / bogo_only
-// columns. We detect this on first load and fall back to in-memory only so
-// the UI stays functional either way.
-let hasKeywordCol = true;
-let hasBogoCol = true;
+
+// ---------- Toast for silent-save feedback ----------
+// The toolbar keyword input and BOGO toggle both debounce-save via
+// scheduleSave(); previously failures only went to console.warn, so a broken
+// save was invisible to the user. This surfaces both success and failure.
+let _toastEl = null;
+let _toastTimer = null;
+function ensureToast() {
+  if (_toastEl) return _toastEl;
+  _toastEl = document.createElement('div');
+  _toastEl.id = 'prefsToast';
+  _toastEl.setAttribute('role', 'status');
+  _toastEl.setAttribute('aria-live', 'polite');
+  Object.assign(_toastEl.style, {
+    position: 'fixed',
+    top: '14px',
+    left: '50%',
+    transform: 'translateX(-50%) translateY(-8px)',
+    background: '#1f2937',
+    color: '#fff',
+    padding: '9px 16px',
+    borderRadius: '999px',
+    fontSize: '13px',
+    fontWeight: '600',
+    boxShadow: '0 6px 24px rgba(0,0,0,0.18)',
+    opacity: '0',
+    transition: 'opacity .18s ease, transform .18s ease',
+    zIndex: '9999',
+    pointerEvents: 'none',
+    maxWidth: '90vw',
+    textAlign: 'center',
+  });
+  document.body.appendChild(_toastEl);
+  return _toastEl;
+}
+function showPrefsToast(msg, kind = 'info') {
+  const el = ensureToast();
+  el.textContent = msg;
+  el.style.background = kind === 'error' ? '#b91c1c' : kind === 'ok' ? '#15803d' : '#1f2937';
+  el.style.opacity = '1';
+  el.style.transform = 'translateX(-50%) translateY(0)';
+  clearTimeout(_toastTimer);
+  _toastTimer = setTimeout(() => {
+    el.style.opacity = '0';
+    el.style.transform = 'translateX(-50%) translateY(-8px)';
+  }, kind === 'error' ? 4000 : 1400);
+}
 
 export function currentFilters() {
   return current;
@@ -40,27 +82,17 @@ export function isActive() {
 
 async function loadFor(userId) {
   if (!supabase) return { ...DEFAULTS };
-  // Try the full column set first; if the migration hasn't been applied,
-  // fall back to the legacy columns.
-  let { data, error } = await supabase
+  // The keyword and bogo_only columns landed in the schema on 2026-07-31 —
+  // there is no longer a legacy code path. If the query fails now, we want
+  // it to surface loudly rather than silently degrade to a subset of prefs.
+  const { data, error } = await supabase
     .from(TABLE)
     .select('categories, watchlist, sale_types, keyword, bogo_only')
     .eq('user_id', userId)
     .maybeSingle();
-  if (error && /column .* does not exist|keyword|bogo_only/i.test(error.message || '')) {
-    console.warn('[prefs] keyword/bogo_only columns missing — run the migration in SUPABASE_SETUP.md.');
-    hasKeywordCol = false;
-    hasBogoCol = false;
-    const legacy = await supabase
-      .from(TABLE)
-      .select('categories, watchlist, sale_types')
-      .eq('user_id', userId)
-      .maybeSingle();
-    data = legacy.data;
-    error = legacy.error;
-  }
   if (error) {
-    console.warn('[prefs] load error:', error.message);
+    console.error('[prefs] load error:', error);
+    showPrefsToast(`Load failed: ${error.message}`, 'error');
     return { ...DEFAULTS };
   }
   if (!data) return { ...DEFAULTS };
@@ -80,28 +112,15 @@ async function saveFor(userId, prefs) {
     categories: prefs.categories,
     watchlist: prefs.watchlist,
     sale_types: prefs.sale_types,
+    keyword: prefs.keyword || '',
+    bogo_only: !!prefs.bogo_only,
     updated_at: new Date().toISOString(),
   };
-  if (hasKeywordCol) row.keyword = prefs.keyword || '';
-  if (hasBogoCol) row.bogo_only = !!prefs.bogo_only;
   const { error } = await supabase
     .from(TABLE)
     .upsert(row, { onConflict: 'user_id' });
   if (error) {
-    // If the extra columns are missing, retry once without them.
-    if (/column .* does not exist|keyword|bogo_only/i.test(error.message || '')) {
-      hasKeywordCol = false;
-      hasBogoCol = false;
-      const { error: e2 } = await supabase.from(TABLE).upsert({
-        user_id: userId,
-        categories: prefs.categories,
-        watchlist: prefs.watchlist,
-        sale_types: prefs.sale_types,
-        updated_at: new Date().toISOString(),
-      }, { onConflict: 'user_id' });
-      if (e2) throw e2;
-      return;
-    }
+    console.error('[prefs] save error:', error);
     throw error;
   }
 }
@@ -116,9 +135,12 @@ function scheduleSave() {
   const userId = user.id;
   const snapshot = { ...current };
   _saveTimer = setTimeout(() => {
-    saveFor(userId, snapshot).catch(err => {
-      console.warn('[prefs] save failed:', err.message);
-    });
+    saveFor(userId, snapshot)
+      .then(() => showPrefsToast('Saved', 'ok'))
+      .catch(err => {
+        console.warn('[prefs] save failed:', err.message);
+        showPrefsToast(`Save failed: ${err.message}`, 'error');
+      });
   }, 250);
 }
 
@@ -252,7 +274,14 @@ function alreadyInChips(value) {
 }
 
 function readPrefsFromModal() {
+  // Pull any pending text still in the watchlist input — otherwise a user who
+  // types "cabernet" and hits Save without pressing Enter loses their entry.
+  const pendingInput = $('watchlistInput');
+  const pending = pendingInput?.value.trim().replace(/,$/, '').trim();
   const watchlist = [...document.querySelectorAll('#watchlistChips .wl-chip')].map(c => c.dataset.w);
+  if (pending && !watchlist.some(w => w.toLowerCase() === pending.toLowerCase())) {
+    watchlist.push(pending);
+  }
   // Keep whatever is currently in `current` for the fields not exposed in the
   // modal — they're managed by the toolbar controls directly.
   return {
@@ -281,10 +310,12 @@ async function savePrefs() {
     await saveFor(userId, prefs);
     current = prefs;
     $('prefStatus').textContent = 'Saved.';
+    showPrefsToast('Preferences saved', 'ok');
     window.dispatchEvent(new CustomEvent('publix-prefs-change'));
     setTimeout(() => { $('prefsModal').hidden = true; }, 500);
   } catch (err) {
     $('prefStatus').textContent = `Error: ${err.message}`;
+    showPrefsToast(`Save failed: ${err.message}`, 'error');
   }
 }
 
@@ -351,8 +382,10 @@ function initPrefsUI() {
     if (!userId) return;
     try {
       await saveFor(userId, { categories: [], watchlist: [], sale_types: [], keyword: '', bogo_only: false });
+      showPrefsToast('Filters cleared', 'ok');
     } catch (err) {
       console.warn('[prefs] clear save failed:', err.message);
+      showPrefsToast(`Clear failed: ${err.message}`, 'error');
     }
   });
 }

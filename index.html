@@ -165,7 +165,8 @@
   .filter-controls .keyword-input {
     width: 100%;
     font-family: inherit;
-    font-size: 14px;
+    /* Must be >=16px so iOS Safari does not auto-zoom on focus. */
+    font-size: 16px;
     padding: 9px 32px 9px 34px;
     border: 1px solid var(--line);
     border-radius: 8px;
@@ -640,7 +641,8 @@
   .pref-input, input[type="email"].pref-input, input[type="text"].pref-input {
     width: 100%;
     font-family: inherit;
-    font-size: 14px;
+    /* Must be >=16px so iOS Safari does not auto-zoom on focus. */
+    font-size: 16px;
     padding: 10px 12px;
     border: 1px solid var(--line);
     border-radius: 8px;
@@ -1451,8 +1453,8 @@
 
 <!-- Supabase auth + preferences (ES modules, load after the inline render script
      so window.publixRerender exists when they dispatch their first events). -->
-<script type="module" src="auth.js"></script>
-<script type="module" src="preferences.js"></script>
+<script type="module" src="auth.js?v=20260731"></script>
+<script type="module" src="preferences.js?v=20260731"></script>
 
 </body>
 </html>
