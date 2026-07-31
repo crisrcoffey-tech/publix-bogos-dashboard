@@ -8,9 +8,41 @@ const DEFAULTS = Object.freeze({
   categories: [],
   watchlist: [],
   sale_types: [],
-  keyword: '',
+  // Chip-based multi-keyword filter. Persisted as a JSON-stringified array
+  // in the TEXT `keyword` column (see saveFor/loadFor). Legacy single-string
+  // values from before 2026-07-31 are auto-migrated on load into a single-
+  // item array so users don't lose the keyword they had saved.
+  keyword: [],
   bogo_only: false,
 });
+
+// Parse whatever is in the TEXT `keyword` column into an array of chip
+// strings. Accepts: (a) a JSON-stringified array (the new format),
+// (b) a plain non-empty string (legacy single-keyword), or (c) empty/null.
+function parseKeywordField(raw) {
+  if (Array.isArray(raw)) return raw.map(s => String(s)).filter(Boolean);
+  if (typeof raw !== 'string') return [];
+  const trimmed = raw.trim();
+  if (!trimmed) return [];
+  if (trimmed.startsWith('[')) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (Array.isArray(parsed)) return parsed.map(s => String(s)).filter(Boolean);
+    } catch (_) { /* fall through to legacy */ }
+  }
+  // Legacy single-string value — convert to a single-item chip list.
+  return [trimmed];
+}
+
+// Serialize the chip array for storage. Always JSON-stringify so the round-
+// trip is unambiguous; empty array becomes '[]' (falsy-ish for older reads,
+// still a valid JSON array for new reads).
+function serializeKeywordField(kw) {
+  const arr = Array.isArray(kw)
+    ? kw.map(s => String(s || '').trim()).filter(Boolean)
+    : (kw ? [String(kw).trim()].filter(Boolean) : []);
+  return JSON.stringify(arr);
+}
 
 let current = { ...DEFAULTS };
 let signedIn = false;
@@ -75,7 +107,7 @@ export function isActive() {
     (current.categories?.length || 0) > 0 ||
     (current.watchlist?.length || 0) > 0 ||
     (current.sale_types?.length || 0) > 0 ||
-    !!current.keyword ||
+    (Array.isArray(current.keyword) ? current.keyword.length > 0 : !!current.keyword) ||
     !!current.bogo_only
   );
 }
@@ -100,7 +132,7 @@ async function loadFor(userId) {
     categories: Array.isArray(data.categories) ? data.categories : [],
     watchlist: Array.isArray(data.watchlist) ? data.watchlist : [],
     sale_types: Array.isArray(data.sale_types) ? data.sale_types : [],
-    keyword: typeof data.keyword === 'string' ? data.keyword : '',
+    keyword: parseKeywordField(data.keyword),
     bogo_only: !!data.bogo_only,
   };
 }
@@ -112,7 +144,7 @@ async function saveFor(userId, prefs) {
     categories: prefs.categories,
     watchlist: prefs.watchlist,
     sale_types: prefs.sale_types,
-    keyword: prefs.keyword || '',
+    keyword: serializeKeywordField(prefs.keyword),
     bogo_only: !!prefs.bogo_only,
     updated_at: new Date().toISOString(),
   };
@@ -148,8 +180,15 @@ export function setCategories(arr) {
   current = { ...current, categories: Array.isArray(arr) ? [...arr] : [] };
   scheduleSave();
 }
+// Accepts either an array of chip strings (new format) or a single string
+// (treated as a one-chip list) so any callers that predate the chip refactor
+// keep working.
 export function setKeyword(kw) {
-  current = { ...current, keyword: String(kw || '') };
+  let arr;
+  if (Array.isArray(kw)) arr = kw.map(s => String(s || '').trim()).filter(Boolean);
+  else if (kw) arr = [String(kw).trim()].filter(Boolean);
+  else arr = [];
+  current = { ...current, keyword: arr };
   scheduleSave();
 }
 export function setBogo(on) {
@@ -287,7 +326,7 @@ function readPrefsFromModal() {
   return {
     categories: current.categories || [],
     sale_types: current.sale_types || [],
-    keyword: current.keyword || '',
+    keyword: Array.isArray(current.keyword) ? current.keyword : parseKeywordField(current.keyword),
     bogo_only: !!current.bogo_only,
     watchlist,
   };
@@ -381,7 +420,7 @@ function initPrefsUI() {
     }
     if (!userId) return;
     try {
-      await saveFor(userId, { categories: [], watchlist: [], sale_types: [], keyword: '', bogo_only: false });
+      await saveFor(userId, { categories: [], watchlist: [], sale_types: [], keyword: [], bogo_only: false });
       showPrefsToast('Filters cleared', 'ok');
     } catch (err) {
       console.warn('[prefs] clear save failed:', err.message);

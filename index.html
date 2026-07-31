@@ -167,7 +167,7 @@
     font-family: inherit;
     /* Must be >=16px so iOS Safari does not auto-zoom on focus. */
     font-size: 16px;
-    padding: 9px 32px 9px 34px;
+    padding: 9px 12px 9px 34px;
     border: 1px solid var(--line);
     border-radius: 8px;
     background: #fff;
@@ -179,21 +179,39 @@
     border-color: var(--publix-green);
     box-shadow: 0 0 0 3px var(--publix-green-soft);
   }
-  .filter-controls .keyword-clear {
-    position: absolute;
-    right: 6px;
-    top: 50%;
-    transform: translateY(-50%);
-    background: transparent;
-    border: none;
-    color: var(--muted);
-    cursor: pointer;
-    padding: 4px 6px;
-    line-height: 0;
-    border-radius: 6px;
+  /* Chip row for the multi-keyword filter (mirrors .watchlist-chips in the
+     Preferences modal so the two feel like the same control). */
+  .keyword-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    padding: 10px 0 0;
   }
-  .filter-controls .keyword-clear:hover { background: #f3f4f6; color: var(--ink); }
-  .filter-controls .keyword-clear svg { width: 14px; height: 14px; }
+  .kw-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    background: var(--publix-green-soft);
+    color: var(--publix-green-dark);
+    padding: 5px 6px 5px 11px;
+    border-radius: 999px;
+    font-size: 13px;
+    font-weight: 600;
+  }
+  .kw-remove {
+    background: rgba(0,0,0,.08);
+    color: var(--publix-green-dark);
+    border: none;
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    font-size: 14px;
+    line-height: 1;
+    cursor: pointer;
+    padding: 0;
+    font-family: inherit;
+  }
+  .kw-remove:hover { background: rgba(0,0,0,.16); }
   .bogo-toggle {
     display: inline-flex;
     align-items: center;
@@ -829,16 +847,16 @@
       <div class="search-wrap">
         <i data-lucide="search"></i>
         <input type="text" id="keywordInput" class="keyword-input"
-          placeholder="Search deals (name or details)…"
+          placeholder="Search deals — press Enter to add a keyword…"
           autocomplete="off" spellcheck="false" />
-        <button type="button" id="keywordClear" class="keyword-clear" aria-label="Clear search" hidden>
-          <i data-lucide="x"></i>
-        </button>
       </div>
       <button type="button" id="bogoToggle" class="bogo-toggle" role="switch" aria-checked="false">
         <i data-lucide="tag"></i> BOGO only
       </button>
     </div>
+    <!-- Chip row for the multi-keyword filter. Chips OR-combine against
+         name+details; multiple chips broaden the result set. -->
+    <div class="keyword-chips" id="keywordChips" role="list" aria-label="Active keyword filters" hidden></div>
     <div class="chips store-row" id="storeChips" role="group" aria-label="Store filter" hidden></div>
     <div class="chips" id="chips" role="group" aria-label="Category filter (multi-select)"></div>
   </div>
@@ -1010,19 +1028,41 @@
   let DATA = null;
   // Multi-select set of category names. Empty = "All" (no category filter).
   let activeCategories = new Set();
-  // Free-text keyword substring against name + details, case-insensitive.
-  let activeKeyword = '';
+  // Chip-based multi-keyword filter. Each chip is a case-insensitive substring
+  // matched against `name + " " + details`. Multiple chips OR-combine (a deal
+  // is included if it matches ANY chip); zero chips means no keyword filter.
+  let activeKeywords = [];
   // BOGO-only toggle (independent of category chips).
   let activeBogo = false;
   // Single-store filter. null = all stores. When set, header shows that store's
   // own weekOf instead of the generic freshness label.
   let activeStore = null;
-  // Debounce handles: one throttles re-renders while typing (the deal grid
-  // is ~1500 items so a per-keystroke render blocks the main thread for
-  // hundreds of ms and eats subsequent keystrokes); the other batches the
-  // Supabase persistence write.
+  // Debounce handles: one throttles re-renders when chips change (the deal
+  // grid is ~1500 items so a per-change render blocks the main thread); the
+  // other batches the Supabase persistence write.
   let _kwRenderTimer = null;
   let _kwSaveTimer = null;
+
+  // Case-insensitive dedup check used when adding new chips.
+  function keywordAlreadyChipped(v) {
+    const lower = String(v || '').trim().toLowerCase();
+    if (!lower) return true;
+    return activeKeywords.some(k => k.toLowerCase() === lower);
+  }
+
+  function renderKeywordChips() {
+    const wrap = document.getElementById('keywordChips');
+    if (!wrap) return;
+    if (!activeKeywords.length) {
+      wrap.hidden = true;
+      wrap.innerHTML = '';
+      return;
+    }
+    wrap.hidden = false;
+    wrap.innerHTML = activeKeywords.map(k =>
+      `<span class="kw-chip" role="listitem" data-k="${esc(k)}">${esc(k)} <button type="button" class="kw-remove" aria-label="Remove ${esc(k)}">×</button></span>`
+    ).join('');
+  }
 
   // Sync UI-owned filter state FROM the persisted prefs (called after auth /
   // prefs change). Signed-out users see empty defaults; signed-in users see
@@ -1031,27 +1071,28 @@
     const prefs = window.publixPrefs?.currentFilters?.() || null;
     const kwInput = document.getElementById('keywordInput');
     // If the user is actively editing the keyword input, do NOT overwrite
-    // their in-flight value or the module state derived from it. The prior
-    // version reset kwInput.value on every rerenderAll — including the
-    // async post-data-load and post-auth-resolve rerenders — which silently
-    // wiped whatever the user typed before those fired. That's why typing
-    // in the search box looked like it had no effect.
+    // their in-flight text (the chip list itself is still safe to refresh —
+    // only the unsubmitted text in the input matters here). The prior fix
+    // this preserves: async post-data-load / post-auth-resolve rerenders
+    // must not wipe whatever the user is mid-typing.
     const userIsTypingKeyword = kwInput && document.activeElement === kwInput;
+    const pendingText = userIsTypingKeyword ? kwInput.value : null;
     if (!prefs) {
       activeCategories = new Set();
-      if (!userIsTypingKeyword) activeKeyword = '';
+      activeKeywords = [];
       activeBogo = false;
     } else {
       activeCategories = new Set(Array.isArray(prefs.categories) ? prefs.categories : []);
-      if (!userIsTypingKeyword) activeKeyword = String(prefs.keyword || '');
+      // prefs.keyword is now an array of chip strings (see preferences.js).
+      // Legacy single-string values are converted there before we see them.
+      activeKeywords = Array.isArray(prefs.keyword)
+        ? prefs.keyword.map(s => String(s || '').trim()).filter(Boolean)
+        : (prefs.keyword ? [String(prefs.keyword).trim()].filter(Boolean) : []);
       activeBogo = !!prefs.bogo_only;
     }
-    // Reflect into the UI controls if they exist.
-    if (kwInput && !userIsTypingKeyword) {
-      kwInput.value = activeKeyword;
-      const clr = document.getElementById('keywordClear');
-      if (clr) clr.hidden = !activeKeyword;
-    }
+    // Restore the user's in-flight input text if they were mid-typing.
+    if (kwInput && userIsTypingKeyword) kwInput.value = pendingText;
+    renderKeywordChips();
     const bogoBtn = document.getElementById('bogoToggle');
     if (bogoBtn) {
       bogoBtn.classList.toggle('on', activeBogo);
@@ -1066,7 +1107,12 @@
   // the user toggles category chips.
   function preFilterDeals() {
     const deals = DATA?.deals || [];
-    const kw = activeKeyword.trim().toLowerCase();
+    // Chip-based keyword filter: OR across chips (any-match wins). Empty
+    // chip list means no keyword filter applied (show all).
+    const kwLower = activeKeywords
+      .map(k => String(k || '').trim().toLowerCase())
+      .filter(Boolean);
+    const hasKeywords = kwLower.length > 0;
     // Watchlist stays as an OR-inclusion signal for signed-in users, matching
     // the pre-Phase-1 behavior.
     const prefs = window.publixPrefs?.currentFilters?.() || null;
@@ -1077,9 +1123,9 @@
       // matchesStore: single-store filter chip. null = all.
       const matchesStore = !activeStore || d.store === activeStore;
       if (!matchesStore) return false;
-      // matchesKeyword: substring against name + details, case-insensitive
-      const matchesKeyword = !kw
-        || (String(d.name || '') + ' ' + String(d.details || '')).toLowerCase().includes(kw);
+      // matchesKeyword: OR across chips against name+details, case-insensitive
+      const haystack = (String(d.name || '') + ' ' + String(d.details || '')).toLowerCase();
+      const matchesKeyword = !hasKeywords || kwLower.some(k => haystack.includes(k));
       // matchesBogo: independent BOGO toggle. Deals with deal==="BOGO" or
       // category==="BOGO" (Publix ad section) both count as BOGO.
       const matchesBogo = !activeBogo
@@ -1259,8 +1305,13 @@
     if (activeCategories.size)
       parts.push(`${activeCategories.size} categor${activeCategories.size === 1 ? 'y' : 'ies'}`);
     if (activeBogo) parts.push('BOGO only');
-    if (activeKeyword.trim())
-      parts.push(`"${activeKeyword.trim().slice(0, 24)}${activeKeyword.trim().length > 24 ? '…' : ''}"`);
+    if (activeKeywords.length) {
+      const preview = activeKeywords.slice(0, 2)
+        .map(k => `"${k.slice(0, 20)}${k.length > 20 ? '…' : ''}"`)
+        .join(', ');
+      const more = activeKeywords.length > 2 ? ` +${activeKeywords.length - 2} more` : '';
+      parts.push(`keyword${activeKeywords.length === 1 ? '' : 's'}: ${preview}${more}`);
+    }
     if (prefs?.watchlist?.length)
       parts.push(`${prefs.watchlist.length} watchlist item${prefs.watchlist.length === 1 ? '' : 's'}`);
     if (!parts.length) { wrap.hidden = true; return; }
@@ -1370,12 +1421,11 @@
   // the UI-owned filter state too.
   window.publixResetActiveCategory = function () {
     activeCategories = new Set();
-    activeKeyword = '';
+    activeKeywords = [];
     activeBogo = false;
     const kwInput = document.getElementById('keywordInput');
     if (kwInput) kwInput.value = '';
-    const clr = document.getElementById('keywordClear');
-    if (clr) clr.hidden = true;
+    renderKeywordChips();
     const bogoBtn = document.getElementById('bogoToggle');
     if (bogoBtn) {
       bogoBtn.classList.remove('on');
@@ -1386,47 +1436,83 @@
   // ---------- Wire keyword input + BOGO toggle ----------
   function wireFilterControls() {
     const kwInput = document.getElementById('keywordInput');
-    const kwClear = document.getElementById('keywordClear');
+    const kwChips = document.getElementById('keywordChips');
     const bogoBtn = document.getElementById('bogoToggle');
 
-    if (kwInput) {
-      // Live filter as they type — but debounce both the (expensive) render
-      // and the Supabase persistence write. Without the render debounce a
-      // full re-render fires on every keystroke and blocks the main thread
-      // long enough that fast typers lose characters or feel the input is
-      // frozen (the original symptom: 'typing has no visible effect').
-      kwInput.addEventListener('input', () => {
-        activeKeyword = kwInput.value;
-        if (kwClear) kwClear.hidden = !activeKeyword;
-        clearTimeout(_kwRenderTimer);
-        _kwRenderTimer = setTimeout(() => {
-          renderChips();
-          renderDeals();
-          renderFilterPill();
-        }, 90);
-        clearTimeout(_kwSaveTimer);
-        _kwSaveTimer = setTimeout(() => {
-          window.publixPrefs?.setKeyword?.(activeKeyword);
-        }, 400);
-      });
-      // Also save immediately on blur so we don't lose a keyword the user
-      // typed and then walked away from before debounce fired.
-      kwInput.addEventListener('blur', () => {
-        clearTimeout(_kwSaveTimer);
-        window.publixPrefs?.setKeyword?.(activeKeyword);
-      });
-    }
-    if (kwClear) {
-      kwClear.addEventListener('click', () => {
-        activeKeyword = '';
-        if (kwInput) kwInput.value = '';
-        kwClear.hidden = true;
+    // Commit whatever's currently in the input as a new chip (dedup on
+    // case-insensitive match). Returns true if a chip was actually added.
+    function commitPendingKeyword() {
+      if (!kwInput) return false;
+      const v = kwInput.value.replace(/,+$/, '').trim();
+      kwInput.value = '';
+      if (!v || keywordAlreadyChipped(v)) return false;
+      activeKeywords = [...activeKeywords, v];
+      renderKeywordChips();
+      // Debounced re-render (~90ms) — the ~1500-item grid is expensive; the
+      // debounce prevents rapid Enter presses from stacking renders on the
+      // main thread. Save is debounced separately so we batch Supabase
+      // writes when the user adds several chips quickly.
+      clearTimeout(_kwRenderTimer);
+      _kwRenderTimer = setTimeout(() => {
         renderChips();
         renderDeals();
         renderFilterPill();
-        window.publixPrefs?.setKeyword?.('');
+      }, 90);
+      clearTimeout(_kwSaveTimer);
+      _kwSaveTimer = setTimeout(() => {
+        window.publixPrefs?.setKeyword?.(activeKeywords);
+      }, 400);
+      return true;
+    }
+
+    function removeKeywordChip(value) {
+      const before = activeKeywords.length;
+      activeKeywords = activeKeywords.filter(k => k !== value);
+      if (activeKeywords.length === before) return;
+      renderKeywordChips();
+      clearTimeout(_kwRenderTimer);
+      _kwRenderTimer = setTimeout(() => {
+        renderChips();
+        renderDeals();
+        renderFilterPill();
+      }, 90);
+      clearTimeout(_kwSaveTimer);
+      _kwSaveTimer = setTimeout(() => {
+        window.publixPrefs?.setKeyword?.(activeKeywords);
+      }, 400);
+    }
+
+    if (kwInput) {
+      kwInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ',') {
+          e.preventDefault();
+          commitPendingKeyword();
+        } else if (e.key === 'Backspace' && !kwInput.value && activeKeywords.length) {
+          // Convenience: empty-input Backspace pops the last chip, matching
+          // most tag-input UIs.
+          e.preventDefault();
+          removeKeywordChip(activeKeywords[activeKeywords.length - 1]);
+        }
+      });
+      // Commit on blur so a user who types "chicken" and taps away without
+      // hitting Enter still gets a chip (mirrors the watchlist input's save-
+      // on-close behavior in preferences.js).
+      kwInput.addEventListener('blur', () => {
+        commitPendingKeyword();
       });
     }
+
+    if (kwChips) {
+      // Event delegation so newly-rendered chips work without re-wiring.
+      kwChips.addEventListener('click', (e) => {
+        const btn = e.target.closest('.kw-remove');
+        if (!btn) return;
+        const chip = btn.closest('.kw-chip');
+        if (!chip) return;
+        removeKeywordChip(chip.dataset.k);
+      });
+    }
+
     if (bogoBtn) {
       bogoBtn.addEventListener('click', () => {
         activeBogo = !activeBogo;
